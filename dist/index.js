@@ -21734,8 +21734,8 @@ function clientOptions() {
 	assign(options, "creator", getInput("creator"));
 	assign(options, "ancestry", getInput("ancestry"));
 	assign(options, "otherBases", getInput("other-bases"));
-	assign(options, "maxWritesPerRun", integer(getInput("max-writes-per-run"), "max-writes-per-run"));
-	assign(options, "maxWritesPerMinute", integer(getInput("max-writes-per-minute"), "max-writes-per-minute"));
+	assign(options, "maxWritesPerRun", positiveInteger(getInput("max-writes-per-run"), "max-writes-per-run"));
+	assign(options, "maxWritesPerMinute", positiveInteger(getInput("max-writes-per-minute"), "max-writes-per-minute"));
 	const descriptions = {};
 	assign(descriptions, "pass", getInput("description-pass"));
 	assign(descriptions, "fail", getInput("description-fail"));
@@ -21770,10 +21770,12 @@ function assign(target, key, value) {
 function booleanInput(name, fallback) {
 	return getInput(name).length === 0 ? fallback : getBooleanInput(name);
 }
-function integer(value, name) {
+/** Both caps are positive by contract; checking here names the input rather than the library option. */
+function positiveInteger(value, name) {
 	if (value.length === 0) return;
-	if (!/^\d+$/.test(value)) throw new ConfigError(`${name} expects a non-negative integer, got "${value}".`);
-	return Number(value);
+	const parsed = /^\d+$/.test(value) ? Number(value) : NaN;
+	if (!Number.isSafeInteger(parsed) || parsed < 1) throw new ConfigError(`${name} expects a positive integer, got "${value}".`);
+	return parsed;
 }
 function setCommonOutputs(values) {
 	for (const [name, value] of Object.entries(values)) setOutput(name, String(value));
