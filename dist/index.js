@@ -16497,7 +16497,7 @@ function nonNegativeInt(value, name, fallback) {
 }
 function positiveInt(value, name, fallback) {
 	if (value === void 0) return fallback;
-	if (!Number.isInteger(value) || value < 1) throw new ConfigError(`${name} must be a positive integer.`);
+	if (!Number.isSafeInteger(value) || value < 1) throw new ConfigError(`${name} must be a positive integer.`);
 	return value;
 }
 //#endregion
