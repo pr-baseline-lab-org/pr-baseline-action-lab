@@ -20260,7 +20260,7 @@ const OPEN_PULLS_QUERY = `
 					baseRefName
 					headRepository { nameWithOwner }
 					commits(last: 1) {
-						nodes { commit { status { context(name: $context) { state description targetUrl creator { login } } } } }
+						nodes { commit { status { context(name: $context) { state description targetUrl creator { login __typename } } } } }
 					}
 				}
 			}
@@ -20281,7 +20281,7 @@ const COMMIT_STATUS_QUERY = `
 	query ($owner: String!, $name: String!, $oid: GitObjectID!, $context: String!) {
 		repository(owner: $owner, name: $name) {
 			object(oid: $oid) {
-				... on Commit { status { context(name: $context) { state description targetUrl creator { login } } } }
+				... on Commit { status { context(name: $context) { state description targetUrl creator { login __typename } } } }
 			}
 		}
 	}
@@ -20365,8 +20365,12 @@ function toRecord(node) {
 		state: node.state.toLowerCase(),
 		description: node.description,
 		targetUrl: node.targetUrl,
-		creator: node.creator?.login ?? null
+		creator: node.creator === null ? null : creatorLogin(node.creator)
 	};
+}
+/** GraphQL names a bot by its bare login; REST and the resolved creator carry the `[bot]` suffix, so it is restored here. */
+function creatorLogin(creator) {
+	return creator.__typename === "Bot" && !creator.login.endsWith("[bot]") ? `${creator.login}[bot]` : creator.login;
 }
 //#endregion
 //#region src/github/refs.ts
