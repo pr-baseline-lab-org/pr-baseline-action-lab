@@ -16486,6 +16486,10 @@ function compactTemplates(templates) {
 	}
 	return result;
 }
+/** The repository's web URL on the configured server, with a trailing slash on the server trimmed. */
+function repoUrl(config) {
+	return `${config.serverUrl.replace(/\/+$/, "")}/${config.repo}`;
+}
 /** The git server behind a REST root: `api.github.com` is `github.com`, a GHES `/api/v3` root is its host. */
 function serverUrlFor(apiUrl) {
 	if (apiUrl === "https://api.github.com") return "https://github.com";
@@ -17045,8 +17049,11 @@ function normalize(file) {
 }
 const LISTED_BASELINES = 2;
 const ELLIPSIS = "…";
-/** Combines per-baseline answers into the one status the context carries. */
-function computeVerdict(baselines, context) {
+/**
+* Combines per-baseline answers into the one status the context carries.
+* With `head`, a failing status without a configured link points at the commits the head lacks up to the first missing baseline.
+*/
+function computeVerdict(baselines, context, head) {
 	const applicable = baselines.filter((entry) => entry.applicable);
 	const missing = applicable.filter((entry) => entry.sha !== null && entry.contains === false).map((entry) => entry.name);
 	const names = applicable.map((entry) => entry.name);
@@ -17056,12 +17063,21 @@ function computeVerdict(baselines, context) {
 		missing,
 		applicable: names
 	};
+	const first = applicable.find((entry) => entry.name === missing[0])?.sha ?? null;
 	return {
 		kind: "fail",
-		status: payload("failure", context.descriptions.fail, context, missing),
+		status: {
+			...payload("failure", context.descriptions.fail, context, missing),
+			targetUrl: context.targetUrl ?? compareUrl(context, head, first)
+		},
 		missing,
 		applicable: names
 	};
+}
+/** GitHub's three-dot compare: the commits reachable from the baseline that the head does not contain. */
+function compareUrl(context, head, baseline) {
+	if (context.repoUrl === void 0 || head === void 0 || baseline === null) return;
+	return `${context.repoUrl}/compare/${head}...${baseline}`;
 }
 /** The pass written for a PR outside the base branch when `other-bases` is `pass`. */
 function notApplicableVerdict(context) {
@@ -17166,7 +17182,7 @@ async function evaluateCommit(input) {
 			contains
 		});
 	}
-	return computeVerdict(answers, input.context);
+	return computeVerdict(answers, input.context, input.sha);
 }
 /** Baselines whose commit is not on the base branch; such a baseline can never be satisfied by merging. */
 async function baselinesOffBase(ancestry, baselines, baseHead) {
@@ -20482,7 +20498,8 @@ async function runRefreshPrStatus(runtime, options) {
 	const context = {
 		base,
 		descriptions: config.descriptions,
-		targetUrl: config.targetUrl
+		targetUrl: config.targetUrl,
+		repoUrl: repoUrl(config)
 	};
 	const result = (verdict, baselines) => ({
 		sha: target.sha,
@@ -20937,7 +20954,8 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 	const context = {
 		base,
 		descriptions: config.descriptions,
-		targetUrl: config.targetUrl
+		targetUrl: config.targetUrl,
+		repoUrl: repoUrl(config)
 	};
 	const inScope = setup.pulls;
 	logger.info(`Base ${base} at ${baseHead.slice(0, 12)}; ${inScope.length} open PRs; ${describe$1(baselines)}.`);
@@ -21310,7 +21328,8 @@ async function staleness(runtime, ancestry, baselines, head, pulls, base, heads)
 	const context = {
 		base,
 		descriptions: config.descriptions,
-		targetUrl: config.targetUrl
+		targetUrl: config.targetUrl,
+		repoUrl: repoUrl(config)
 	};
 	let stale = 0;
 	let current = 0;
