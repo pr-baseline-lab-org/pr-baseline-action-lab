@@ -16329,10 +16329,21 @@ function info(message) {
 //#endregion
 //#region src/refname.ts
 /**
-* Validates a tag name the way `git check-ref-format refs/tags/<name>` would; `@` alone is valid there.
+* Baselines live under their own namespace, which clones never fetch, so a move can never clobber a developer's local tag.
+* The REST refs API addresses a ref without the leading `refs/`.
+*/
+const BASELINE_REF_PREFIX = "refs/baselines/";
+function baselineRef(name) {
+	return `${BASELINE_REF_PREFIX}${name}`;
+}
+function baselineRefPath(name) {
+	return baselineRef(name).slice(5);
+}
+/**
+* Validates a baseline name the way `git check-ref-format refs/baselines/<name>` would; `@` alone is valid there.
 * Implemented in TypeScript so validation needs no git binary.
 */
-function isValidTagName(name) {
+function isValidRefName(name) {
 	if (name.length === 0 || name.endsWith("/") || name.startsWith("/")) return false;
 	if (name.includes("//") || name.includes("..") || name.includes("@{")) return false;
 	if (name.endsWith(".") || name.endsWith(".lock")) return false;
@@ -16346,7 +16357,7 @@ const DEFAULT_API_URL = "https://api.github.com";
 const DEFAULT_RETRY_BASE_MS = 1e3;
 const DEFAULT_DESCRIPTIONS = {
 	pass: "Contains the required {base} changes.",
-	fail: "Merge or rebase {base} to include: {tags}",
+	fail: "Merge or rebase {base} to include: {baselines}",
 	notApplicable: "Baseline applies to {base} only."
 };
 const ANCESTRY_MODES = new Set([
@@ -16356,7 +16367,7 @@ const ANCESTRY_MODES = new Set([
 ]);
 const OTHER_BASES = new Set(["skip", "pass"]);
 const BASELINE_KEYS = new Set([
-	"tag",
+	"name",
 	"label",
 	"scope",
 	"markers"
@@ -16407,10 +16418,10 @@ function resolveConfig(options) {
 		retryBaseMs: nonNegativeInt(options.retryBaseMs, "retryBaseMs", DEFAULT_RETRY_BASE_MS)
 	};
 }
-/** Builds the one-entry list the `--tag`, `--label` and `--markers` shorthand describes. */
+/** Builds the one-entry list the `--name`, `--label` and `--markers` shorthand describes. */
 function shorthandBaselines(input) {
 	const baseline = {
-		tag: input.tag ?? "pr-baseline",
+		name: input.name ?? "pr-baseline",
 		label: input.label ?? "Require PR update"
 	};
 	if (input.markers !== void 0) baseline.markers = input.markers;
@@ -16429,7 +16440,7 @@ function parseBaselines(json, readFile) {
 }
 /** Validates the baseline list against the full schema; every problem is fatal. */
 function validateBaselines(value) {
-	if (!Array.isArray(value)) throw new ConfigError("Baselines must be a JSON array of { tag, label?, scope?, markers? }.");
+	if (!Array.isArray(value)) throw new ConfigError("Baselines must be a JSON array of { name, label?, scope?, markers? }.");
 	if (value.length === 0) throw new ConfigError("Baselines must contain at least one entry.");
 	const seen = /* @__PURE__ */ new Set();
 	return value.map((entry, index) => {
@@ -16437,11 +16448,11 @@ function validateBaselines(value) {
 		if (typeof entry !== "object" || entry === null || Array.isArray(entry)) throw new ConfigError(`${where} must be an object.`);
 		const record = entry;
 		for (const key of Object.keys(record)) if (!BASELINE_KEYS.has(key)) throw new ConfigError(`${where} has an unknown field "${key}".`);
-		const tag = record["tag"];
-		if (typeof tag !== "string" || !isValidTagName(tag)) throw new ConfigError(`${where} needs a valid tag name (git check-ref-format rules).`);
-		if (seen.has(tag)) throw new ConfigError(`Baseline tag "${tag}" is listed more than once.`);
-		seen.add(tag);
-		const baseline = { tag };
+		const name = record["name"];
+		if (typeof name !== "string" || !isValidRefName(name)) throw new ConfigError(`${where} needs a valid name (git check-ref-format rules).`);
+		if (seen.has(name)) throw new ConfigError(`Baseline "${name}" is listed more than once.`);
+		seen.add(name);
+		const baseline = { name };
 		if (record["label"] !== void 0) {
 			const label = record["label"];
 			if (typeof label !== "string" || label.trim().length === 0) throw new ConfigError(`${where} has an empty label.`);
@@ -17030,24 +17041,24 @@ function normalize(file) {
 	while (path.startsWith("./")) path = path.slice(2);
 	return path.startsWith("/") ? path.slice(1) : path;
 }
-const LISTED_TAGS = 2;
+const LISTED_BASELINES = 2;
 const ELLIPSIS = "…";
 /** Combines per-baseline answers into the one status the context carries. */
 function computeVerdict(baselines, context) {
 	const applicable = baselines.filter((entry) => entry.applicable);
-	const missing = applicable.filter((entry) => entry.sha !== null && entry.contains === false).map((entry) => entry.tag);
-	const tags = applicable.map((entry) => entry.tag);
+	const missing = applicable.filter((entry) => entry.sha !== null && entry.contains === false).map((entry) => entry.name);
+	const names = applicable.map((entry) => entry.name);
 	if (missing.length === 0) return {
 		kind: "pass",
-		status: payload("success", context.descriptions.pass, context, tags),
+		status: payload("success", context.descriptions.pass, context, names),
 		missing,
-		applicable: tags
+		applicable: names
 	};
 	return {
 		kind: "fail",
 		status: payload("failure", context.descriptions.fail, context, missing),
 		missing,
-		applicable: tags
+		applicable: names
 	};
 }
 /** The pass written for a PR outside the base branch when `other-bases` is `pass`. */
@@ -17060,20 +17071,20 @@ function notApplicableVerdict(context) {
 	};
 }
 /** A pass that names a baseline no longer on the base branch, so an operator mistake blocks nobody. */
-function misconfiguredVerdict(tags, context) {
+function misconfiguredVerdict(names, context) {
 	return {
 		kind: "misconfigured",
-		status: payload("success", "Baseline misconfigured: {tags} not on {base}; ask a maintainer.", context, tags),
+		status: payload("success", "Baseline misconfigured: {baselines} not on {base}; ask a maintainer.", context, names),
 		missing: [],
-		applicable: tags
+		applicable: names
 	};
 }
-/** Fills `{base}` and `{tags}` and bounds the result so a long template can never cause an API error. */
+/** Fills `{base}` and `{baselines}` and bounds the result so a long template can never cause an API error. */
 function renderDescription(template, values) {
-	const listed = values.tags.slice(0, LISTED_TAGS).join(", ");
-	const rest = values.tags.length - LISTED_TAGS;
-	const tags = rest > 0 ? `${listed} and ${rest} more` : listed;
-	return boundDescription(template.replaceAll("{base}", values.base).replaceAll("{tags}", tags));
+	const listed = values.baselines.slice(0, LISTED_BASELINES).join(", ");
+	const rest = values.baselines.length - LISTED_BASELINES;
+	const baselines = rest > 0 ? `${listed} and ${rest} more` : listed;
+	return boundDescription(template.replaceAll("{base}", values.base).replaceAll("{baselines}", baselines));
 }
 /** Truncates to the API limit by code points, ending with an ellipsis when cut. */
 function boundDescription(text) {
@@ -17086,12 +17097,12 @@ function statusMatches(current, intended, creator) {
 	if (current === null) return false;
 	return current.state === intended.state && (current.description ?? "") === intended.description && (current.targetUrl ?? "") === (intended.targetUrl ?? "") && current.creator === creator;
 }
-function payload(state, template, context, tags) {
+function payload(state, template, context, baselines) {
 	return {
 		state,
 		description: renderDescription(template, {
 			base: context.base,
-			tags
+			baselines
 		}),
 		targetUrl: context.targetUrl
 	};
@@ -17111,10 +17122,10 @@ function shortSha(sha) {
 var BaselineError = class extends Error {
 	name = "BaselineError";
 };
-/** Every baseline as `{ tag, sha }`, absent tags included, for adapters that verify them against their own view. */
-function tagSnapshot(baselines) {
+/** Every baseline as `{ name, sha }`, absent ones included, for adapters that verify them against their own view. */
+function refSnapshot(baselines) {
 	return baselines.map((baseline) => ({
-		tag: baseline.tag,
+		name: baseline.name,
 		sha: baseline.sha
 	}));
 }
@@ -17147,7 +17158,7 @@ async function evaluateCommit(input) {
 		let contains = null;
 		if (baseline.applicable && baseline.sha !== null) contains = await input.ancestry.isAncestor(baseline.sha, input.sha);
 		answers.push({
-			tag: baseline.tag,
+			name: baseline.name,
 			sha: baseline.sha,
 			applicable: baseline.applicable,
 			contains
@@ -17155,10 +17166,10 @@ async function evaluateCommit(input) {
 	}
 	return computeVerdict(answers, input.context);
 }
-/** Tags whose commit is not on the base branch; such a baseline can never be satisfied by merging. */
+/** Baselines whose commit is not on the base branch; such a baseline can never be satisfied by merging. */
 async function baselinesOffBase(ancestry, baselines, baseHead) {
 	const off = [];
-	for (const baseline of baselines) if (baseline.sha !== null && !await ancestry.isAncestor(baseline.sha, baseHead)) off.push(baseline.tag);
+	for (const baseline of baselines) if (baseline.sha !== null && !await ancestry.isAncestor(baseline.sha, baseHead)) off.push(baseline.name);
 	return off;
 }
 //#endregion
@@ -20374,14 +20385,14 @@ function creatorLogin(creator) {
 }
 //#endregion
 //#region src/github/refs.ts
-/** Reads the commit a tag points at, peeling annotated tags; null when the tag does not exist. */
-async function readTag(api, repo, tag) {
+/** Reads the commit a baseline ref points at, peeling tag objects; null when the ref does not exist. */
+async function readBaselineRef(api, repo, name) {
 	const parts = repoParts(repo);
 	let object;
 	try {
 		object = (await api.request("GET /repos/{owner}/{repo}/git/ref/{ref}", {
 			...parts,
-			ref: `tags/${tag}`
+			ref: baselineRefPath(name)
 		})).data.object;
 	} catch (error) {
 		if (isGitHubError(error, "not-found")) return null;
@@ -20389,29 +20400,32 @@ async function readTag(api, repo, tag) {
 	}
 	const seen = /* @__PURE__ */ new Set();
 	while (object.type === "tag") {
-		if (seen.has(object.sha)) throw new GitHubError("other", `GET /repos/${repo}/git/tags/${object.sha}`, `Tag ${tag} points at a cycle of tag objects.`);
+		if (seen.has(object.sha)) throw new GitHubError("other", `GET /repos/${repo}/git/tags/${object.sha}`, `Baseline ${name} points at a cycle of tag objects.`);
 		seen.add(object.sha);
 		object = (await api.request("GET /repos/{owner}/{repo}/git/tags/{tag_sha}", {
 			...parts,
 			tag_sha: object.sha
 		})).data.object;
 	}
-	if (object.type !== "commit") throw new GitHubError("other", `GET /repos/${repo}/git/ref/tags/${tag}`, `Tag ${tag} points at a ${object.type}, not a commit.`);
+	if (object.type !== "commit") throw new GitHubError("other", `GET /repos/${repo}/git/ref/${baselineRefPath(name)}`, `Baseline ${name} points at a ${object.type}, not a commit.`);
 	return object.sha;
 }
-/** Creates a lightweight tag; a 422 means the ref already exists. */
-async function createTag(api, repo, tag, sha) {
+/** Creates the baseline ref; a 422 means it already exists. */
+async function createBaselineRef(api, repo, name, sha) {
 	await api.request("POST /repos/{owner}/{repo}/git/refs", {
 		...repoParts(repo),
-		ref: `refs/tags/${tag}`,
+		ref: baselineRef(name),
 		sha
 	});
 }
-/** Moves a tag with `force: false`, so the server rejects anything but a fast-forward. */
-async function fastForwardTag(api, repo, tag, sha) {
+/**
+* Moves the baseline ref with `force: false`.
+* GitHub enforces a fast-forward only for branches, so the caller must check ancestry first and re-read afterwards.
+*/
+async function updateBaselineRef(api, repo, name, sha) {
 	await api.request("PATCH /repos/{owner}/{repo}/git/refs/{ref}", {
 		...repoParts(repo),
-		ref: `tags/${tag}`,
+		ref: baselineRefPath(name),
 		sha,
 		force: false
 	});
@@ -20494,7 +20508,7 @@ async function runRefreshPrStatus(runtime, options) {
 	const prepare = (list, head) => ancestry.prepare?.({
 		shas: [head, target.sha],
 		pulls: [],
-		tags: config.offline ? [] : tagSnapshot(list)
+		refs: config.offline ? [] : refSnapshot(list)
 	});
 	await prepare(baselines, baseHead);
 	const evaluate = (list, head) => evaluateWithGuard({
@@ -20695,10 +20709,10 @@ async function runRefreshPrStatuses(runtime, input = {}) {
 		const prepared = await ancestry.prepare?.({
 			shas: [baseHead],
 			pulls: inScope.map((pull) => pull.number),
-			tags: input.verifyTags ?? tagSnapshot(baselines)
+			refs: input.verifyRefs ?? refSnapshot(baselines)
 		});
 		const off = await baselinesOffBase(ancestry, baselines, baseHead);
-		if (off.length > 0) throw new BaselineError(`Baseline ${off.join(", ")} is not an ancestor of ${base}; fix the tag before refreshing.`);
+		if (off.length > 0) throw new BaselineError(`Baseline ${off.join(", ")} is not an ancestor of ${base}; fix the baseline before refreshing.`);
 		if (prepared !== void 0) {
 			const stillOpen = new Map((await list()).map((pull) => [pull.number, pull]));
 			for (const pull of inScope) if (!stillOpen.has(pull.number)) {
@@ -20874,7 +20888,7 @@ function entry(pull, outcome, verdict, error) {
 	};
 }
 function describe$1(baselines) {
-	return baselines.map((baseline) => `${baseline.tag}=${baseline.sha === null ? "absent" : baseline.sha.slice(0, 12)}`).join(", ");
+	return baselines.map((baseline) => `${baseline.name}=${baseline.sha === null ? "absent" : baseline.sha.slice(0, 12)}`).join(", ");
 }
 function message(error) {
 	return error instanceof Error ? error.message : String(error);
@@ -20886,18 +20900,18 @@ async function runMoveBaseline(runtime, options) {
 	const { config, api, logger } = runtime;
 	if (config.offline) throw new ConfigError("move-baseline needs the API; --offline applies to refresh-pr-status only.");
 	const ancestry = await runtime.ancestry();
-	if (options.baseline !== void 0 && options.baseline !== "" && !config.baselines.some((baseline) => baseline.tag === options.baseline)) throw new ConfigError(`No configured baseline has the tag "${options.baseline}".`);
+	if (options.baseline !== void 0 && options.baseline !== "" && !config.baselines.some((baseline) => baseline.name === options.baseline)) throw new ConfigError(`No configured baseline is named "${options.baseline}".`);
 	const base = await runtime.base();
 	if (options.refreshPrStatuses) await runtime.creator();
 	const baselines = await runtime.readBaselines();
-	const before = tagSnapshot(baselines);
+	const before = refSnapshot(baselines);
 	const selected = select(baselines, options.baseline);
 	const head = await runtime.head();
 	const target = options.to === void 0 || options.to === "" ? head : await resolveCommit(runtime.api, runtime.config.repo, options.to);
 	const prepare = (shas) => ancestry.prepare?.({
 		shas,
 		pulls: [],
-		tags: tagSnapshot(baselines)
+		refs: refSnapshot(baselines)
 	});
 	await prepare([head, target]);
 	if (target !== head && !await ancestry.isAncestor(target, head)) throw new BaselineError(`Target ${shortSha(target)} is not on ${base}; a baseline must be reachable from the base branch.`);
@@ -20922,14 +20936,14 @@ async function runMoveBaseline(runtime, options) {
 	};
 	if (options.refreshPrStatuses) result.refresh = await runRefreshPrStatuses(runtime, {
 		baselines: authoritative,
-		...config.dryRun ? { verifyTags: before } : {}
+		...config.dryRun ? { verifyRefs: before } : {}
 	});
 	return result;
 	async function moveOne(baseline, to, merges, forced) {
 		let current = baseline.sha;
 		for (let attempt = 1;; attempt++) {
 			if (current === to) return {
-				tag: baseline.tag,
+				name: baseline.name,
 				from: current,
 				to,
 				moved: false,
@@ -20937,25 +20951,25 @@ async function runMoveBaseline(runtime, options) {
 			};
 			const decision = await decide$1(ancestry, baseline, current, to, merges, forced);
 			if ("note" in decision) return {
-				tag: baseline.tag,
+				name: baseline.name,
 				from: current,
 				to,
 				moved: false,
 				note: decision.note
 			};
-			if (current !== null && !await ancestry.isAncestor(current, to)) throw new BaselineError(`Refusing to move ${baseline.tag}: ${shortSha(to)} does not descend from ${shortSha(current)}.`);
+			if (current !== null && !await ancestry.isAncestor(current, to)) throw new BaselineError(`Refusing to move ${baseline.name}: ${shortSha(to)} does not descend from ${shortSha(current)}.`);
 			if (config.dryRun) return {
-				tag: baseline.tag,
+				name: baseline.name,
 				from: current,
 				to,
 				moved: true,
 				reason: decision.reason
 			};
 			try {
-				if (current === null) await createTag(api, config.repo, baseline.tag, to);
-				else await fastForwardTag(api, config.repo, baseline.tag, to);
+				if (current === null) await createBaselineRef(api, config.repo, baseline.name, to);
+				else await updateBaselineRef(api, config.repo, baseline.name, to);
 				return {
-					tag: baseline.tag,
+					name: baseline.name,
 					from: current,
 					to,
 					moved: true,
@@ -20963,10 +20977,10 @@ async function runMoveBaseline(runtime, options) {
 				};
 			} catch (error) {
 				if (!isGitHubError(error, "conflict") && !isGitHubError(error, "validation")) throw error;
-				const latest = await readTag(api, config.repo, baseline.tag);
+				const latest = await readBaselineRef(api, config.repo, baseline.name);
 				if (latest === current) throw error;
-				if (attempt > 1) throw new BaselineError(`${baseline.tag} moved twice during this run (now ${latest === null ? "absent" : shortSha(latest)}); rerun to converge.`);
-				logger.warn(`${baseline.tag} moved to ${latest === null ? "absent" : shortSha(latest)} while this run was deciding; re-evaluating once.`);
+				if (attempt > 1) throw new BaselineError(`${baseline.name} moved twice during this run (now ${latest === null ? "absent" : shortSha(latest)}); rerun to converge.`);
+				logger.warn(`${baseline.name} moved to ${latest === null ? "absent" : shortSha(latest)} while this run was deciding; re-evaluating once.`);
 				current = latest;
 				baseline.sha = latest;
 				if (latest !== null) await prepare([latest]);
@@ -20977,7 +20991,7 @@ async function runMoveBaseline(runtime, options) {
 /** Whether a baseline should move from `current` to `target`, and why. */
 async function decide$1(ancestry, baseline, current, target, merges, force) {
 	if (force) return { reason: "forced" };
-	if (current === null) return { note: "tag is absent; seed it with --force" };
+	if (current === null) return { note: "absent; seed it with --force" };
 	if (baseline.label !== void 0) {
 		for (const oid of merges.get(baseline.label) ?? []) if (oid !== current && await ancestry.isAncestor(current, oid) && await ancestry.isAncestor(oid, target)) return { reason: "label" };
 	}
@@ -21001,16 +21015,16 @@ async function labeledMerges(runtime, base, baselines) {
 	}
 	return merges;
 }
-function select(baselines, tag) {
-	if (tag === void 0 || tag === "") return baselines;
-	const match = baselines.filter((baseline) => baseline.tag === tag);
-	if (match.length === 0) throw new ConfigError(`No configured baseline has the tag "${tag}".`);
+function select(baselines, name) {
+	if (name === void 0 || name === "") return baselines;
+	const match = baselines.filter((baseline) => baseline.name === name);
+	if (match.length === 0) throw new ConfigError(`No configured baseline is named "${name}".`);
 	return match;
 }
 function describe(move) {
 	const from = move.from === null ? "absent" : shortSha(move.from);
-	if (move.moved) return `${move.tag}: ${from} -> ${shortSha(move.to)} (${move.reason}).`;
-	return `${move.tag}: unchanged at ${from}; ${move.note}.`;
+	if (move.moved) return `${move.name}: ${from} -> ${shortSha(move.to)} (${move.reason}).`;
+	return `${move.name}: unchanged at ${from}; ${move.note}.`;
 }
 //#endregion
 //#region src/commands/report.ts
@@ -21029,13 +21043,13 @@ async function runReport(runtime) {
 	const prepared = await ancestry.prepare?.({
 		shas: [head],
 		pulls: pulls.map((pull) => pull.number),
-		tags: tagSnapshot(baselines)
+		refs: refSnapshot(baselines)
 	});
-	const bound = new Map(baselines.map((baseline) => [baseline.tag, 0]));
+	const bound = new Map(baselines.map((baseline) => [baseline.name, 0]));
 	for (const pull of pulls) {
 		const fetched = prepared?.heads.get(pull.number);
 		if (fetched === null) {
-			for (const baseline of baselines) bound.set(baseline.tag, (bound.get(baseline.tag) ?? 0) + 1);
+			for (const baseline of baselines) bound.set(baseline.name, (bound.get(baseline.name) ?? 0) + 1);
 			continue;
 		}
 		const applicable = await applicableBaselines({
@@ -21045,15 +21059,15 @@ async function runReport(runtime) {
 			baseHead: head,
 			logger
 		});
-		for (const baseline of applicable) if (baseline.applicable) bound.set(baseline.tag, (bound.get(baseline.tag) ?? 0) + 1);
+		for (const baseline of applicable) if (baseline.applicable) bound.set(baseline.name, (bound.get(baseline.name) ?? 0) + 1);
 	}
 	const report = [];
 	for (const baseline of baselines) report.push({
 		...baseline,
 		onBase: baseline.sha === null ? null : await ancestry.isAncestor(baseline.sha, head),
-		bound: bound.get(baseline.tag) ?? 0
+		bound: bound.get(baseline.name) ?? 0
 	});
-	const offBase = report.filter((baseline) => baseline.onBase === false).map((b) => b.tag);
+	const offBase = report.filter((baseline) => baseline.onBase === false).map((b) => b.name);
 	if (offBase.length > 0) logger.warn(`Baseline ${offBase.join(", ")} is not on ${base}; refreshes refuse to run until it is fixed.`);
 	const result = {
 		base,
@@ -21136,7 +21150,7 @@ function createGitAncestry(options) {
 			return changedFiles(repo, from, to);
 		},
 		async prepare(input) {
-			await verifyTags(repo, input.tags);
+			await verifyRefs(repo, input.refs);
 			const heads = input.pulls.length > 0 ? await fetchPullHeads(repo, input.pulls) : /* @__PURE__ */ new Map();
 			if (input.pulls.length > 0) logger.info(`Fetched ${[...heads.values()].filter((oid) => oid !== null).length} PR heads treelessly.`);
 			await ensure(input.shas);
@@ -21145,17 +21159,17 @@ function createGitAncestry(options) {
 	};
 }
 /**
-* The API answer is authoritative; the remote's advertised tag, peeled to its commit through `<ref>^{}`, must agree.
-* A disagreement in either direction means the tag moved between the two reads, and the run must start over.
+* The API answer is authoritative; the remote's advertised baseline ref, peeled to its commit through `<ref>^{}`, must agree.
+* A disagreement in either direction means the baseline moved between the two reads, and the run must start over.
 */
-async function verifyTags(repo, tags) {
-	if (tags.length === 0) return;
-	const remote = await lsRemote(repo, tags.flatMap((entry) => [`refs/tags/${entry.tag}`, `refs/tags/${entry.tag}^{}`]));
-	const moved = tags.filter((entry) => {
-		const ref = `refs/tags/${entry.tag}`;
+async function verifyRefs(repo, refs) {
+	if (refs.length === 0) return;
+	const remote = await lsRemote(repo, refs.flatMap((entry) => [baselineRef(entry.name), `${baselineRef(entry.name)}^{}`]));
+	const moved = refs.filter((entry) => {
+		const ref = baselineRef(entry.name);
 		return (remote.get(`${ref}^{}`) ?? remote.get(ref) ?? null) !== entry.sha;
 	});
-	if (moved.length > 0) throw new BaselineError(`Tag ${moved.map((entry) => entry.tag).join(", ")} differs between the API and the remote; it moved during this run, rerun to converge.`);
+	if (moved.length > 0) throw new BaselineError(`Baseline ${moved.map((entry) => entry.name).join(", ")} differs between the API and the remote; it moved during this run, rerun to converge.`);
 }
 /** Git's wording for a ref or commit the remote no longer offers; anything else is a real failure. */
 function isMissingOnRemote(error) {
@@ -21271,7 +21285,7 @@ async function selectAncestry(config, api, logger) {
 }
 /**
 * Delegates to git until a git command fails while preparing, then to the API for the rest of the run.
-* Integrity refusals (a tag disagreement, a configuration error) are not git failures and still end the run.
+* Integrity refusals (a baseline ref disagreement, a configuration error) are not git failures and still end the run.
 */
 function withApiFallback(git, api, logger) {
 	let active = git;
@@ -21428,7 +21442,7 @@ function createRuntime(options) {
 			const resolved = [];
 			const repo = config.offline ? await runtime.repo() : null;
 			for (const baseline of config.baselines) {
-				const sha = repo === null ? await readTag(api, config.repo, baseline.tag) : await revParse(repo, `refs/tags/${baseline.tag}`);
+				const sha = repo === null ? await readBaselineRef(api, config.repo, baseline.name) : await revParse(repo, baselineRef(baseline.name));
 				resolved.push({
 					...baseline,
 					sha
@@ -21745,12 +21759,12 @@ function clientOptions() {
 }
 function baselineList() {
 	const json = getInput("baselines");
-	const tag = getInput("tag");
+	const name = getInput("name");
 	const label = getInput("label");
 	const markers = getMultilineInput("markers").map((line) => line.trim()).filter((line) => line.length > 0);
-	const shorthand = tag.length > 0 || label.length > 0 || markers.length > 0;
+	const shorthand = name.length > 0 || label.length > 0 || markers.length > 0;
 	if (json.length > 0) {
-		if (shorthand) throw new ConfigError("baselines cannot be combined with tag, label or markers.");
+		if (shorthand) throw new ConfigError("baselines cannot be combined with name, label or markers.");
 		if (json.startsWith("@")) throw new ConfigError("baselines takes the JSON array itself; the action does not read files.");
 		return parseBaselines(json, () => {
 			throw new ConfigError("baselines takes the JSON array itself; the action does not read files.");
@@ -21758,7 +21772,7 @@ function baselineList() {
 	}
 	if (!shorthand) return;
 	return shorthandBaselines({
-		...tag.length > 0 ? { tag } : {},
+		...name.length > 0 ? { name } : {},
 		...label.length > 0 ? { label } : {},
 		...markers.length > 0 ? { markers } : {}
 	});
@@ -21782,7 +21796,7 @@ function setCommonOutputs(values) {
 }
 function baselinesOutput(baselines) {
 	return JSON.stringify(baselines.map((baseline) => ({
-		tag: baseline.tag,
+		name: baseline.name,
 		sha: baseline.sha
 	})));
 }
@@ -21849,8 +21863,8 @@ function boundedSummary(result, extra = {}, budget = OUTPUT_BUDGET) {
 		keep = Math.floor(keep / 2);
 	}
 	const { entries, baselines, ...counts } = result;
-	const moves = Array.isArray(extra["moves"]) ? extra["moves"].map(({ tag, moved }) => ({
-		tag,
+	const moves = Array.isArray(extra["moves"]) ? extra["moves"].map(({ name, moved }) => ({
+		name,
 		moved
 	})) : void 0;
 	return JSON.stringify({
@@ -21949,7 +21963,7 @@ async function reportMove(result, dryRun) {
 			header: true
 		}
 	], ...result.moves.map((move) => [
-		move.tag,
+		move.name,
 		move.from === null ? "absent" : move.from.slice(0, 12),
 		move.to.slice(0, 12),
 		move.moved ? "yes" : "no",
@@ -21962,7 +21976,7 @@ async function reportMove(result, dryRun) {
 	}
 	emit({
 		state: "success",
-		description: moved.length === 0 ? "No baseline moved" : `Moved ${moved.map((move) => move.tag).join(", ")}`,
+		description: moved.length === 0 ? "No baseline moved" : `Moved ${moved.map((move) => move.name).join(", ")}`,
 		base: result.base,
 		baselines: baselinesOutput(result.baselines),
 		missing: "[]",
@@ -22008,14 +22022,14 @@ async function reportReport(result) {
 			header: true
 		}
 	], ...result.baselines.map((baseline) => [
-		baseline.tag,
+		baseline.name,
 		baseline.sha === null ? "absent" : baseline.sha.slice(0, 12),
 		baseline.onBase === null ? "" : baseline.onBase ? "yes" : "NO",
 		String(baseline.bound)
 	])]);
 	if (result.stale !== void 0 && result.current !== void 0) summary$1.addRaw(`\n${result.current} PRs current, ${result.stale} stale.\n`);
 	await writeSummary();
-	if (result.offBase.length > 0) setFailed(`Baseline ${result.offBase.join(", ")} is not on ${result.base}; fix the tag.`);
+	if (result.offBase.length > 0) setFailed(`Baseline ${result.offBase.join(", ")} is not on ${result.base}; fix the baseline.`);
 }
 function describeError(error) {
 	if (error instanceof ConfigError || error instanceof BaselineError) return error.message;
