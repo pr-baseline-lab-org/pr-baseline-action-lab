@@ -12,6 +12,8 @@ import "timers";
 import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 //#region \0rolldown/runtime.js
 var __create = Object.create;
 var __defProp = Object.defineProperty;
@@ -16049,7 +16051,7 @@ var __awaiter$5 = function(thisArg, _arguments, P, generator) {
 		step((generator = generator.apply(thisArg, _arguments || [])).next());
 	});
 };
-const { chmod, copyFile, lstat, mkdir, open, readdir, rename, rm, rmdir, stat, symlink, unlink } = fs.promises;
+const { chmod, copyFile, lstat, mkdir, open, readdir, rename, rm: rm$1, rmdir, stat, symlink, unlink } = fs.promises;
 const IS_WINDOWS$1 = process.platform === "win32";
 fs.constants.O_RDONLY;
 /**
@@ -17174,7 +17176,7 @@ async function baselinesOffBase(ancestry, baselines, baseHead) {
 }
 //#endregion
 //#region src/git/repo.ts
-const run$1 = promisify(execFile);
+const run$2 = promisify(execFile);
 /** Refspecs per fetch or ls-remote invocation, and the characters they may add up to: well under Windows' 8 KiB line limit. */
 const REF_BATCH = 200;
 const BATCH_CHARS = 6e3;
@@ -17229,11 +17231,15 @@ function isUncFileUrl(url) {
 }
 const HARDENING = [
 	["core.hooksPath", "/dev/null"],
+	["push.gpgSign", "false"],
 	["credential.helper", ""],
 	["fetch.recurseSubmodules", "false"],
 	["maintenance.auto", "false"],
 	["gc.auto", "0"],
-	["credential.interactive", "false"]
+	["credential.interactive", "false"],
+	["push.followTags", "false"],
+	["push.recurseSubmodules", "no"],
+	["push.pushOption", ""]
 ];
 /**
 * The environment every git subprocess starts from: English messages, replacement objects and grafts
@@ -17299,7 +17305,7 @@ async function openRepo(dir, options = {}) {
 	const cwd = dir ?? process.cwd();
 	let top;
 	try {
-		const { stdout } = await run$1("git", ["rev-parse", "--show-toplevel"], {
+		const { stdout } = await run$2("git", ["rev-parse", "--show-toplevel"], {
 			cwd,
 			env
 		});
@@ -17323,7 +17329,7 @@ async function openRepo(dir, options = {}) {
 		url,
 		async git(args, extraEnv = {}) {
 			try {
-				const { stdout } = await run$1("git", args, {
+				const { stdout } = await run$2("git", args, {
 					cwd: top,
 					env: {
 						...env,
@@ -17347,7 +17353,7 @@ async function openRepo(dir, options = {}) {
 async function rawRemoteUrl(top, remote, env) {
 	let urls;
 	try {
-		const { stdout } = await run$1("git", [
+		const { stdout } = await run$2("git", [
 			"config",
 			"-z",
 			"--get-all",
@@ -17362,7 +17368,7 @@ async function rawRemoteUrl(top, remote, env) {
 	}
 	if (urls.length !== 1 || urls[0].length === 0) return null;
 	try {
-		await run$1("git", [
+		await run$2("git", [
 			"config",
 			"--get-regexp",
 			"^url\\..*\\.(push)?insteadof$"
@@ -17375,7 +17381,7 @@ async function rawRemoteUrl(top, remote, env) {
 		if (error.code !== 1) return null;
 	}
 	try {
-		const { stdout } = await run$1("git", [
+		const { stdout } = await run$2("git", [
 			"config",
 			"--show-scope",
 			"--name-only",
@@ -20609,6 +20615,194 @@ async function resolveTarget(runtime, options) {
 	};
 }
 //#endregion
+//#region src/ref-writer.ts
+const run$1 = promisify(execFile);
+/**
+* The writer for a run: a lease push from the clone when there is one, then from a temporary repository, then
+* the refs API, which cannot refuse a concurrent move. Each later way is set up only when the one before failed.
+*/
+function selectRefWriter(clone, options) {
+	const api = createApiRefWriter(options.api, options.repo);
+	if (!options.allowGit) return api;
+	let ephemeral;
+	const ways = [
+		async () => clone === null ? null : createLeaseRefWriter(clone, options),
+		async () => {
+			ephemeral ??= createEphemeralRepo(options);
+			const repo = (await ephemeral)?.repo ?? null;
+			return repo === null ? null : createLeaseRefWriter(repo, options);
+		},
+		async () => {
+			options.logger.warn("Git could not move the ref, so the refs API is used, which cannot refuse a concurrent move.");
+			return api;
+		}
+	];
+	let active = 0;
+	return {
+		async move(baseline, expected, to) {
+			for (;; active++) {
+				const writer = await (ways[active] ?? ways[ways.length - 1])();
+				if (writer === null) continue;
+				try {
+					return await writer.move(baseline, expected, to);
+				} catch (error) {
+					if (!(error instanceof GitError) || writer === api) throw error;
+					options.logger.warn(`Git could not move ${baselineRef(baseline)} (${firstLine(error.stderr) || error.message}); trying the next way.`);
+				}
+			}
+		},
+		async close() {
+			await (await ephemeral)?.close();
+		}
+	};
+}
+/**
+* Moves through the refs API, which enforces a fast-forward for branches only, so every write is re-read.
+* A crossing write that lands just before ours stays invisible, which is why the lease writers come first.
+*/
+function createApiRefWriter(api, repo) {
+	return { async move(baseline, expected, to) {
+		try {
+			if (expected === null) await createBaselineRef(api, repo, baseline, to);
+			else await updateBaselineRef(api, repo, baseline, to);
+		} catch (error) {
+			if (!isGitHubError(error, "conflict") && !isGitHubError(error, "validation")) throw error;
+			const actual = await readBaselineRef(api, repo, baseline);
+			if (actual === expected) throw error;
+			return {
+				ok: false,
+				actual
+			};
+		}
+		const actual = await readBaselineRef(api, repo, baseline);
+		return actual === to ? {
+			ok: true,
+			via: "api"
+		} : {
+			ok: false,
+			actual
+		};
+	} };
+}
+/**
+* Moves with `git push --force-with-lease`, a compare-and-swap the server enforces for every ref.
+* The lease names the advertised object, so a baseline parked on a tag object moves as well; git trouble throws.
+*/
+function createLeaseRefWriter(git, options) {
+	return { async move(baseline, expected, to) {
+		const ref = baselineRef(baseline);
+		const advertised = await lsRemote(git, [ref, `${ref}^{}`]);
+		const raw = advertised.get(ref) ?? null;
+		const peeled = advertised.get(`${ref}^{}`) ?? raw;
+		if (peeled !== expected) return {
+			ok: false,
+			actual: peeled
+		};
+		await fetchMissingCommits(git, [to]);
+		try {
+			await git.git([
+				"push",
+				"--quiet",
+				"--no-verify",
+				"--no-signed",
+				"--no-follow-tags",
+				"--recurse-submodules=no",
+				`--force-with-lease=${ref}:${raw ?? ""}`,
+				"--",
+				git.url ?? git.remote,
+				`${to}:${ref}`
+			]);
+		} catch (error) {
+			if (!(error instanceof GitError)) throw error;
+			const actual = await readBaselineRef(options.api, options.repo, baseline);
+			if (actual !== expected) return {
+				ok: false,
+				actual
+			};
+			throw error;
+		}
+		return {
+			ok: true,
+			via: "git"
+		};
+	} };
+}
+/**
+* An empty repository in a temporary directory, with the server's copy of the repository as its only remote.
+* It exists so a run without a usable clone can still lease-push; null when git cannot set it up.
+*/
+async function createEphemeralRepo(options) {
+	let dir;
+	try {
+		dir = await mkdtemp(join(tmpdir(), "pr-baseline-"));
+	} catch (error) {
+		warnQuietly(options.logger, `No temporary directory for the move (${describeError$1(error)}).`);
+		return null;
+	}
+	let closed = false;
+	const close = async () => {
+		if (!closed) {
+			await rm(dir, {
+				recursive: true,
+				force: true
+			});
+			closed = true;
+		}
+	};
+	const env = gitBaseEnv(process.env, {
+		serverUrl: options.serverUrl,
+		...options.token === void 0 ? {} : { token: options.token }
+	});
+	let failure;
+	try {
+		const url = `${options.serverUrl.replace(/\/+$/, "")}/${options.repo}`;
+		await run$1("git", [
+			"init",
+			"--quiet",
+			"--template=",
+			dir
+		], { env });
+		await run$1("git", [
+			"-C",
+			dir,
+			"remote",
+			"add",
+			"origin",
+			url
+		], { env });
+		const repo = await openRepo(dir, {
+			serverUrl: options.serverUrl,
+			...options.token === void 0 ? {} : { token: options.token }
+		});
+		if (repo !== null) return {
+			repo,
+			close
+		};
+	} catch (error) {
+		failure = error;
+	}
+	warnQuietly(options.logger, `No temporary git repository for the move${failure === void 0 ? "" : ` (${describeError$1(failure)})`}.`);
+	await close().catch((error) => {
+		warnQuietly(options.logger, `Could not remove ${dir} (${describeError$1(error)}).`);
+	});
+	return {
+		repo: null,
+		close
+	};
+}
+/** A diagnostic must never become the failure: an injected logger may throw. */
+function warnQuietly(logger, message) {
+	try {
+		logger.warn(message);
+	} catch {}
+}
+function describeError$1(error) {
+	return error instanceof Error ? error.message : String(error);
+}
+function firstLine(text) {
+	return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
+}
+//#endregion
 //#region src/budget.ts
 const MINUTE_MS = 6e4;
 /**
@@ -20900,6 +21094,18 @@ async function runMoveBaseline(runtime, options) {
 	const { config, api, logger } = runtime;
 	if (config.offline) throw new ConfigError("move-baseline needs the API; --offline applies to refresh-pr-status only.");
 	const ancestry = await runtime.ancestry();
+	let writer;
+	const refWriter = async () => {
+		writer ??= selectRefWriter(ancestry.name === "git" ? await runtime.repo() : null, {
+			api,
+			repo: config.repo,
+			serverUrl: config.serverUrl,
+			token: config.token,
+			logger,
+			allowGit: config.ancestry !== "api"
+		});
+		return writer;
+	};
 	if (options.baseline !== void 0 && options.baseline !== "" && !config.baselines.some((baseline) => baseline.name === options.baseline)) throw new ConfigError(`No configured baseline is named "${options.baseline}".`);
 	const base = await runtime.base();
 	if (options.refreshPrStatuses) await runtime.creator();
@@ -20920,11 +21126,17 @@ async function runMoveBaseline(runtime, options) {
 	const candidateMerges = [...labeled.values()].flat();
 	if (candidateMerges.length > 0) await prepare(candidateMerges);
 	const moves = [];
-	for (const baseline of selected) {
-		const move = await moveOne(baseline, target, labeled, force);
-		moves.push(move);
-		baseline.sha = move.moved ? move.to : move.from;
-		logger.info(describe(move));
+	try {
+		for (const baseline of selected) {
+			const move = await moveOne(baseline, target, labeled, force);
+			moves.push(move);
+			baseline.sha = move.moved ? move.to : move.from;
+			logger.info(describe(move));
+		}
+	} finally {
+		await writer?.close?.().catch((error) => {
+			warnQuietly(logger, `Could not remove the temporary repository (${describeError$1(error)}).`);
+		});
 	}
 	const authoritative = config.dryRun ? baselines : await runtime.readBaselines();
 	const result = {
@@ -20949,6 +21161,13 @@ async function runMoveBaseline(runtime, options) {
 				moved: false,
 				note: "already at the target"
 			};
+			if (attempt > 1 && current !== null && await ancestry.isAncestor(to, current)) return {
+				name: baseline.name,
+				from: current,
+				to,
+				moved: false,
+				note: "another writer moved it past the target"
+			};
 			const decision = await decide$1(ancestry, baseline, current, to, merges, forced);
 			if ("note" in decision) return {
 				name: baseline.name,
@@ -20965,26 +21184,21 @@ async function runMoveBaseline(runtime, options) {
 				moved: true,
 				reason: decision.reason
 			};
-			try {
-				if (current === null) await createBaselineRef(api, config.repo, baseline.name, to);
-				else await updateBaselineRef(api, config.repo, baseline.name, to);
-				return {
-					name: baseline.name,
-					from: current,
-					to,
-					moved: true,
-					reason: decision.reason
-				};
-			} catch (error) {
-				if (!isGitHubError(error, "conflict") && !isGitHubError(error, "validation")) throw error;
-				const latest = await readBaselineRef(api, config.repo, baseline.name);
-				if (latest === current) throw error;
-				if (attempt > 1) throw new BaselineError(`${baseline.name} moved twice during this run (now ${latest === null ? "absent" : shortSha(latest)}); rerun to converge.`);
-				logger.warn(`${baseline.name} moved to ${latest === null ? "absent" : shortSha(latest)} while this run was deciding; re-evaluating once.`);
-				current = latest;
-				baseline.sha = latest;
-				if (latest !== null) await prepare([latest]);
-			}
+			const outcome = await (await refWriter()).move(baseline.name, current, to);
+			if (outcome.ok) return {
+				name: baseline.name,
+				from: current,
+				to,
+				moved: true,
+				reason: decision.reason,
+				via: outcome.via
+			};
+			const latest = outcome.actual;
+			if (attempt > 1) throw new BaselineError(`${baseline.name} moved twice during this run (now ${latest === null ? "absent" : shortSha(latest)}); rerun to converge.`);
+			logger.warn(`${baseline.name} moved to ${latest === null ? "absent" : shortSha(latest)} while this run was deciding; re-evaluating once.`);
+			current = latest;
+			baseline.sha = latest;
+			if (latest !== null) await prepare([latest]);
 		}
 	}
 }
