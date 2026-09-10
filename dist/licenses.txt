@@ -56,7 +56,7 @@ THE SOFTWARE.
 ---
 
 Name: undici
-Version: 6.26.0
+Version: 6.28.1
 License: MIT
 Private: false
 Description: An HTTP/1.1 client, written from scratch for Node.js
@@ -780,3 +780,14 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Name: @mawesome/pr-baseline
+Version: 0.1.0
+License: MIT
+Private: false
+Description: Keep open pull requests current with a movable baseline on the base branch, reported through commit statuses
+Repository: git+https://github.com/mawesomedev/mawesome.git
+Homepage: https://github.com/mawesomedev/mawesome/tree/main/packages/pr-baseline#readme
+Author: Manzoor Ahmad Wani
